@@ -1,0 +1,213 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 400px;
+      padding: 15px;
+      font-family: Arial, sans-serif;
+      margin: 0;
+    }
+    h2 {
+      margin: 0 0 15px 0;
+      font-size: 18px;
+      color: #333;
+    }
+    .section {
+      margin-bottom: 20px;
+      padding-bottom: 15px;
+      border-bottom: 1px solid #ddd;
+    }
+    .section:last-child {
+      border-bottom: none;
+    }
+    input[type="text"], input[type="password"], input[type="number"] {
+      width: 100%;
+      padding: 8px;
+      margin: 5px 0;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    button {
+      padding: 8px 15px;
+      margin: 5px 5px 5px 0;
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #45a049;
+    }
+    button.delete {
+      background-color: #f44336;
+      padding: 5px 10px;
+      font-size: 12px;
+    }
+    button.delete:hover {
+      background-color: #da190b;
+    }
+    .website-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px;
+      background-color: #f5f5f5;
+      margin: 5px 0;
+      border-radius: 4px;
+    }
+    .website-info {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .website-url {
+      font-weight: bold;
+      font-size: 13px;
+    }
+    .time-info {
+      font-size: 11px;
+      color: #666;
+      margin-top: 3px;
+    }
+    .status {
+      margin: 10px 0;
+      padding: 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      display: none;
+    }
+    .status.show {
+      display: block;
+    }
+    .status.success {
+      background-color: #d4edda;
+      color: #155724;
+    }
+    .status.error {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+    .label {
+      font-size: 12px;
+      font-weight: bold;
+      margin-top: 10px;
+      display: block;
+    }
+    .radio-group {
+      margin: 10px 0;
+    }
+    .radio-group label {
+      margin-right: 15px;
+      font-size: 13px;
+    }
+    .time-limit-input {
+      display: none;
+    }
+    .time-limit-input.active {
+      display: block;
+    }
+    #passwordSetup {
+      background-color: #fff3cd;
+      padding: 15px;
+      border-radius: 8px;
+      border: 2px solid #ffc107;
+    }
+  </style>
+</head>
+<body>
+  <div class="section">
+    <div style="display: flex; align-items: center; gap: 10px; margin-bottom: 15px;">
+      <img src="icon48.png" width="32" height="32" style="vertical-align: middle;">
+      <h2 style="margin: 0;">Website Blocker & Time Limiter</h2>
+    </div>
+    <div id="status" class="status"></div>
+    
+    <div id="passwordSetup">
+      <h3 style="margin-top: 0;">⚠️ Set Master Password First</h3>
+      <label class="label">Create Password:</label>
+      <input type="password" id="newPassword" placeholder="Enter password">
+      <input type="password" id="confirmPassword" placeholder="Confirm password">
+      
+      <label class="label">Security Question:</label>
+      <select id="securityQuestion" style="width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ccc; border-radius: 4px;">
+        <option value="">Choose a security question...</option>
+        <option value="pet">What is your first pet's name?</option>
+        <option value="city">What city were you born in?</option>
+        <option value="school">What is your mother's maiden name?</option>
+        <option value="car">What was your first car?</option>
+        <option value="teacher">What is your favorite teacher's name?</option>
+      </select>
+      
+      <input type="password" id="securityAnswer" placeholder="Your answer (hidden)">
+      
+      <button id="setPasswordBtn">Set Password</button>
+    </div>
+  </div>
+
+  <div class="section" id="mainSection" style="display: none;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+      <h2 style="margin: 0;">Add Website</h2>
+      <button id="forgotPasswordBtn" style="background-color: #ff9800; font-size: 11px; padding: 5px 10px;">Forgot Password?</button>
+    </div>
+    <input type="text" id="websiteUrl" placeholder="Enter URL or domain (e.g., youtube.com)">
+    
+    <div class="radio-group">
+      <label><input type="radio" name="blockType" value="full" checked> Full Block</label>
+      <label><input type="radio" name="blockType" value="time"> Time Limit</label>
+    </div>
+    
+    <div id="timeLimitInput" class="time-limit-input">
+      <label class="label">Daily Time Limit (minutes):</label>
+      <input type="number" id="timeLimit" placeholder="e.g., 30" min="1" value="30">
+    </div>
+    
+    <button id="addCurrentBtn">➕ Add Current Website</button>
+    <button id="addBtn">➕ Add Website</button>
+  </div>
+
+  <div class="section" id="listsSection" style="display: none;">
+    <h2>Blocked Websites</h2>
+    <div id="blockedList"></div>
+  </div>
+
+  <div class="section" id="timeSection" style="display: none;">
+    <h2>Time-Limited Websites</h2>
+    <div id="timeLimitedList"></div>
+  </div>
+
+  <div class="section" id="resetSection" style="display: none;">
+    <h2>🔑 Reset Password</h2>
+    <p style="font-size: 13px; color: #666;">Answer your security question to reset your password.</p>
+    
+    <label class="label" id="resetQuestionLabel"></label>
+    <input type="password" id="resetAnswer" placeholder="Your answer (hidden)">
+    
+    <label class="label">New Password:</label>
+    <input type="password" id="resetNewPassword" placeholder="Enter new password">
+    <input type="password" id="resetConfirmPassword" placeholder="Confirm new password">
+    
+    <button id="resetPasswordBtn">Reset Password</button>
+    <button id="cancelResetBtn" style="background-color: #999;">Cancel</button>
+  </div>
+
+  <!-- Password confirmation modal -->
+  <div id="passwordModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
+    <div style="background: white; padding: 25px; border-radius: 10px; width: 300px; box-shadow: 0 5px 20px rgba(0,0,0,0.3);">
+      <h3 style="margin-top: 0;">🔒 Confirm Password</h3>
+      <p style="font-size: 13px; color: #666; margin: 10px 0;">Enter your password to remove this website:</p>
+      <div style="font-weight: bold; background: #f5f5f5; padding: 8px; border-radius: 4px; margin: 10px 0; font-size: 12px; word-break: break-all;" id="removeUrl"></div>
+      <input type="password" id="modalConfirmPassword" placeholder="Enter password" style="width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px;">
+      <div style="display: flex; gap: 10px; margin-top: 15px;">
+        <button id="confirmRemoveBtn" style="flex: 1;">Confirm</button>
+        <button id="cancelRemoveBtn" style="flex: 1; background-color: #999;">Cancel</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>

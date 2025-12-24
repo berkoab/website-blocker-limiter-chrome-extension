@@ -1,0 +1,1662 @@
+// Background service worker
+let timeTracking = {};
+
+// Check if URL matches blocked site
+function matchesSite(url, blockedSite) {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.replace(/^www\./, '');
+    const blockedDomain = blockedSite.replace(/^www\./, '');
+    
+    // Check if it's a domain block or specific URL block
+    if (blockedSite.includes('/')) {
+      // Specific URL block
+      return url.includes(blockedSite);
+    } else {
+      // Domain block
+      return hostname === blockedDomain || hostname.endsWith('.' + blockedDomain);
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+// Check if site should be blocked
+async function shouldBlockSite(url) {
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites', 'timeUsage']);
+  const blockedSites = data.blockedSites || [];
+  const timeLimitedSites = data.timeLimitedSites || [];
+  const timeUsage = data.timeUsage || {};
+  
+  // Check full blocks
+  for (const site of blockedSites) {
+    if (matchesSite(url, site)) {
+      return { blocked: true, reason: 'fully-blocked' };
+    }
+  }
+  
+  // Check time limits
+  const today = new Date().toDateString();
+  for (const site of timeLimitedSites) {
+    if (matchesSite(url, site.url)) {
+      const usage = timeUsage[site.url];
+      if (usage && usage.date === today && usage.time >= site.limit * 60) {
+        return { blocked: true, reason: 'time-exceeded', limit: site.limit };
+      }
+      return { blocked: false, timeLimited: true, site: site.url, limit: site.limit };
+    }
+  }
+  
+  return { blocked: false };
+}
+
+// Update time usage
+async function updateTimeUsage(url, seconds) {
+  const data = await chrome.storage.local.get(['timeLimitedSites', 'timeUsage']);
+  const timeLimitedSites = data.timeLimitedSites || [];
+  const timeUsage = data.timeUsage || {};
+  const today = new Date().toDateString();
+  
+  for (const site of timeLimitedSites) {
+    if (matchesSite(url, site.url)) {
+      if (!timeUsage[site.url] || timeUsage[site.url].date !== today) {
+        timeUsage[site.url] = { date: today, time: 0 };
+      }
+      timeUsage[site.url].time += seconds;
+      await chrome.storage.local.set({ timeUsage });
+      
+      // Check if limit exceeded
+      if (timeUsage[site.url].time >= site.limit * 60) {
+        // Reload the tab to trigger block
+        const tabs = await chrome.tabs.query({});
+        for (const tab of tabs) {
+          if (tab.url && matchesSite(tab.url, site.url)) {
+            chrome.tabs.reload(tab.id);
+          }
+        }
+      }
+      break;
+    }
+  }
+}
+
+// Track time on tabs
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  const tab = await chrome.tabs.get(activeInfo.tabId);
+  if (tab.url) {
+    startTracking(activeInfo.tabId, tab.url);
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url) {
+    startTracking(tabId, changeInfo.url);
+  }
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    stopAllTracking();
+  } else {
+    chrome.tabs.query({ active: true, windowId }, (tabs) => {
+      if (tabs[0]) {
+        startTracking(tabs[0].id, tabs[0].url);
+      }
+    });
+  }
+});
+
+function startTracking(tabId, url) {
+  stopAllTracking();
+  
+  shouldBlockSite(url).then(result => {
+    if (result.timeLimited) {
+      timeTracking[tabId] = {
+        url: url,
+        site: result.site,
+        startTime: Date.now()
+      };
+    }
+  });
+}
+
+function stopAllTracking() {
+  for (const tabId in timeTracking) {
+    const tracking = timeTracking[tabId];
+    const elapsed = Math.floor((Date.now() - tracking.startTime) / 1000);
+    if (elapsed > 0) {
+      updateTimeUsage(tracking.url, elapsed);
+    }
+  }
+  timeTracking = {};
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (timeTracking[tabId]) {
+    const tracking = timeTracking[tabId];
+    const elapsed = Math.floor((Date.now() - tracking.startTime) / 1000);
+    if (elapsed > 0) {
+      updateTimeUsage(tracking.url, elapsed);
+    }
+    delete timeTracking[tabId];
+  }
+});
+
+// Periodic save (every 5 seconds)
+setInterval(() => {
+  for (const tabId in timeTracking) {
+    const tracking = timeTracking[tabId];
+    const elapsed = Math.floor((Date.now() - tracking.startTime) / 1000);
+    if (elapsed >= 5) {
+      updateTimeUsage(tracking.url, elapsed);
+      tracking.startTime = Date.now();
+    }
+  }
+}, 5000);
+
+// Handle navigation
+chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+  if (details.frameId !== 0) return;
+  
+  const result = await shouldBlockSite(details.url);
+  if (result.blocked) {
+    chrome.tabs.update(details.tabId, {
+      url: chrome.runtime.getURL('blocked.html') + 
+           '?reason=' + result.reason + 
+           '&limit=' + (result.limit || '') +
+           '&url=' + encodeURIComponent(details.url)
+    });
+  }
+});
+
+// Message handler
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'checkBlock') {
+    shouldBlockSite(request.url).then(sendResponse);
+    return true;
+  }
+});// Blocked page script
+const params = new URLSearchParams(window.location.search);
+const reason = params.get('reason');
+const limit = params.get('limit');
+const url = params.get('url');
+
+document.getElementById('blockedUrl').textContent = decodeURIComponent(url || '');
+
+if (reason === 'time-exceeded') {
+  document.getElementById('title').textContent = 'Time Limit Exceeded';
+  document.getElementById('message').textContent = 
+    'You have reached your daily time limit for this website.';
+  document.getElementById('timeInfo').style.display = 'block';
+  document.getElementById('timeInfo').innerHTML = 
+    `<strong>Daily Limit:</strong> ${limit} minutes<br>` +
+    `<strong>Status:</strong> Limit reached for today<br>` +
+    `<em>This website will be accessible again tomorrow.</em>`;
+} else {
+  document.getElementById('message').textContent = 
+    'This website has been blocked by your website blocker extension.';
+}// Content script - checks if page should be blocked
+(async function() {
+  const response = await chrome.runtime.sendMessage({
+    action: 'checkBlock',
+    url: window.location.href
+  });
+  
+  if (response && response.blocked) {
+    window.stop();
+    document.documentElement.innerHTML = '';
+    window.location.href = chrome.runtime.getURL('blocked.html') + 
+      '?reason=' + response.reason + 
+      '&limit=' + (response.limit || '') +
+      '&url=' + encodeURIComponent(window.location.href);
+  }
+})();// Popup script - Simplified and debugged version
+console.log('Popup script loaded');
+
+let passwordHash = null;
+
+// Simple hash function
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// Show status message
+function showStatus(message, isError = false) {
+  const status = document.getElementById('status');
+  status.textContent = message;
+  status.className = 'status show ' + (isError ? 'error' : 'success');
+  setTimeout(() => {
+    status.className = 'status';
+  }, 3000);
+}
+
+// Load data
+async function loadData() {
+  try {
+    const data = await chrome.storage.local.get(['passwordHash', 'blockedSites', 'timeLimitedSites', 'timeUsage', 'securityQuestion', 'securityAnswerHash']);
+    passwordHash = data.passwordHash || null;
+    
+    console.log('Loaded data:', data);
+    
+    const passwordSetup = document.getElementById('passwordSetup');
+    const mainSection = document.getElementById('mainSection');
+    const listsSection = document.getElementById('listsSection');
+    const timeSection = document.getElementById('timeSection');
+    const resetSection = document.getElementById('resetSection');
+    
+    // Check if elements exist before accessing style
+    if (!passwordSetup || !mainSection || !listsSection || !timeSection || !resetSection) {
+      console.error('Some UI elements are missing');
+      return;
+    }
+    
+    if (!passwordHash) {
+      passwordSetup.style.display = 'block';
+      mainSection.style.display = 'none';
+      listsSection.style.display = 'none';
+      timeSection.style.display = 'none';
+      resetSection.style.display = 'none';
+    } else {
+      passwordSetup.style.display = 'none';
+      mainSection.style.display = 'block';
+      listsSection.style.display = 'block';
+      timeSection.style.display = 'block';
+      resetSection.style.display = 'none';
+    }
+    
+    displayBlockedSites(data.blockedSites || []);
+    displayTimeLimitedSites(data.timeLimitedSites || [], data.timeUsage || {});
+  } catch (error) {
+    console.error('Error loading data:', error);
+    showStatus('Error loading data: ' + error.message, true);
+  }
+}
+
+// Display blocked sites
+function displayBlockedSites(sites) {
+  const list = document.getElementById('blockedList');
+  if (sites.length === 0) {
+    list.innerHTML = '<p style="color: #999; font-size: 13px;">No blocked websites</p>';
+    return;
+  }
+  
+  list.innerHTML = sites.map(site => `
+    <div class="website-item">
+      <div class="website-info">
+        <div class="website-url">${escapeHtml(site)}</div>
+      </div>
+      <button class="delete" data-url="${escapeHtml(site)}" data-type="blocked">Remove</button>
+    </div>
+  `).join('');
+  
+  list.querySelectorAll('button.delete').forEach(btn => {
+    btn.addEventListener('click', () => removeSite(btn.dataset.url, btn.dataset.type));
+  });
+}
+
+// Display time-limited sites
+function displayTimeLimitedSites(sites, usage) {
+  const list = document.getElementById('timeLimitedList');
+  if (sites.length === 0) {
+    list.innerHTML = '<p style="color: #999; font-size: 13px;">No time-limited websites</p>';
+    return;
+  }
+  
+  const today = new Date().toDateString();
+  
+  list.innerHTML = sites.map(site => {
+    const used = (usage[site.url] && usage[site.url].date === today) 
+      ? Math.floor(usage[site.url].time / 60) 
+      : 0;
+    const remaining = Math.max(0, site.limit - used);
+    
+    return `
+      <div class="website-item">
+        <div class="website-info">
+          <div class="website-url">${escapeHtml(site.url)}</div>
+          <div class="time-info">Limit: ${site.limit}min/day | Used: ${used}min | Remaining: ${remaining}min</div>
+        </div>
+        <button class="delete" data-url="${escapeHtml(site.url)}" data-type="timelimited">Remove</button>
+      </div>
+    `;
+  }).join('');
+  
+  list.querySelectorAll('button.delete').forEach(btn => {
+    btn.addEventListener('click', () => removeSite(btn.dataset.url, btn.dataset.type));
+  });
+}
+
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Normalize URL
+function normalizeUrl(url) {
+  url = url.trim();
+  
+  // Remove protocol
+  url = url.replace(/^https?:\/\//, '');
+  
+  // Remove www
+  url = url.replace(/^www\./, '');
+  
+  // If it has a path, keep it (for specific page blocking)
+  // Otherwise just return the domain
+  if (url.includes('/')) {
+    // Check if it's just a trailing slash
+    if (url.endsWith('/')) {
+      url = url.slice(0, -1);
+    }
+    // If there's actual path content, keep full URL
+    if (url.split('/')[1]) {
+      return url;
+    }
+  }
+  
+  // Just domain
+  return url.split('/')[0];
+}
+
+// Add website function
+async function addWebsite() {
+  console.log('Add website clicked');
+  
+  if (!passwordHash) {
+    showStatus('Please set a password first', true);
+    return;
+  }
+  
+  let url = document.getElementById('websiteUrl').value.trim();
+  if (!url) {
+    showStatus('Please enter a URL', true);
+    return;
+  }
+  
+  url = normalizeUrl(url);
+  console.log('Normalized URL:', url);
+  
+  const blockType = document.querySelector('input[name="blockType"]:checked').value;
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites']);
+  
+  try {
+    if (blockType === 'full') {
+      const blockedSites = data.blockedSites || [];
+      if (blockedSites.includes(url)) {
+        showStatus('Website already blocked', true);
+        return;
+      }
+      blockedSites.push(url);
+      await chrome.storage.local.set({ blockedSites });
+      console.log('Blocked sites updated:', blockedSites);
+      showStatus('✅ Website blocked successfully!');
+    } else {
+      const timeLimit = parseInt(document.getElementById('timeLimit').value);
+      if (!timeLimit || timeLimit < 1) {
+        showStatus('Please enter a valid time limit', true);
+        return;
+      }
+      
+      const timeLimitedSites = data.timeLimitedSites || [];
+      if (timeLimitedSites.find(s => s.url === url)) {
+        showStatus('Website already has a time limit', true);
+        return;
+      }
+      
+      timeLimitedSites.push({ url, limit: timeLimit });
+      await chrome.storage.local.set({ timeLimitedSites });
+      console.log('Time limited sites updated:', timeLimitedSites);
+      showStatus('✅ Time limit set successfully!');
+    }
+    
+    document.getElementById('websiteUrl').value = '';
+    await loadData();
+  } catch (error) {
+    console.error('Error adding website:', error);
+    showStatus('Error: ' + error.message, true);
+  }
+}
+
+// Remove website
+async function removeSite(url, type) {
+  const password = prompt('Enter password to remove this website:');
+  if (!password) return;
+  
+  const hash = await hashPassword(password);
+  if (hash !== passwordHash) {
+    showStatus('❌ Incorrect password', true);
+    return;
+  }
+  
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites']);
+  
+  if (type === 'blocked') {
+    const blockedSites = (data.blockedSites || []).filter(s => s !== url);
+    await chrome.storage.local.set({ blockedSites });
+  } else {
+    const timeLimitedSites = (data.timeLimitedSites || []).filter(s => s.url !== url);
+    await chrome.storage.local.set({ timeLimitedSites });
+  }
+  
+  showStatus('✅ Website removed successfully!');
+  loadData();
+}
+
+// Wait for DOM to load
+window.addEventListener('DOMContentLoaded', function() {
+  console.log('DOM loaded, attaching listeners');
+  
+  let isResetting = false; // Flag to prevent auto-refresh during reset
+  
+  // Set password button
+  const setPasswordBtn = document.getElementById('setPasswordBtn');
+  if (setPasswordBtn) {
+    setPasswordBtn.addEventListener('click', async () => {
+      console.log('Set password clicked');
+      const newPass = document.getElementById('newPassword').value;
+      const confirmPass = document.getElementById('confirmPassword').value;
+      const securityQuestion = document.getElementById('securityQuestion').value;
+      const securityAnswer = document.getElementById('securityAnswer').value.trim();
+      
+      if (!newPass) {
+        showStatus('Please enter a password', true);
+        return;
+      }
+      
+      if (newPass.length < 4) {
+        showStatus('Password must be at least 4 characters', true);
+        return;
+      }
+      
+      if (newPass !== confirmPass) {
+        showStatus('Passwords do not match', true);
+        return;
+      }
+      
+      if (!securityQuestion) {
+        showStatus('Please select a security question', true);
+        return;
+      }
+      
+      if (!securityAnswer) {
+        showStatus('Please answer the security question', true);
+        return;
+      }
+      
+      try {
+        const hash = await hashPassword(newPass);
+        const answerHash = await hashPassword(securityAnswer.toLowerCase());
+        
+        await chrome.storage.local.set({ 
+          passwordHash: hash,
+          securityQuestion: securityQuestion,
+          securityAnswerHash: answerHash
+        });
+        
+        passwordHash = hash;
+        
+        document.getElementById('newPassword').value = '';
+        document.getElementById('confirmPassword').value = '';
+        document.getElementById('securityAnswer').value = '';
+        showStatus('✅ Password set successfully!');
+        await loadData();
+      } catch (error) {
+        console.error('Error setting password:', error);
+        showStatus('Error: ' + error.message, true);
+      }
+    });
+  }
+
+  // Add website button
+  const addBtn = document.getElementById('addBtn');
+  if (addBtn) {
+    addBtn.addEventListener('click', () => {
+      console.log('Add button clicked');
+      addWebsite();
+    });
+  }
+
+  // Add current website button
+  const addCurrentBtn = document.getElementById('addCurrentBtn');
+  if (addCurrentBtn) {
+    addCurrentBtn.addEventListener('click', async () => {
+      console.log('Add current website clicked');
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        console.log('Current tab:', tab);
+        
+        if (tab && tab.url) {
+          if (tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+            showStatus('Cannot block Chrome system pages', true);
+            return;
+          }
+          const url = new URL(tab.url);
+          document.getElementById('websiteUrl').value = url.hostname;
+          // Automatically add it
+          await addWebsite();
+        } else {
+          showStatus('No active tab found', true);
+        }
+      } catch (error) {
+        console.error('Error getting current tab:', error);
+        showStatus('Error: ' + error.message, true);
+      }
+    });
+  }
+
+  // Handle block type radio change
+  document.querySelectorAll('input[name="blockType"]').forEach(radio => {
+    radio.addEventListener('change', (e) => {
+      const timeLimitInput = document.getElementById('timeLimitInput');
+      if (e.target.value === 'time') {
+        timeLimitInput.classList.add('active');
+      } else {
+        timeLimitInput.classList.remove('active');
+      }
+    });
+  });
+
+  // Allow Enter key to add website
+  const websiteUrl = document.getElementById('websiteUrl');
+  if (websiteUrl) {
+    websiteUrl.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        addWebsite();
+      }
+    });
+  }
+
+  // Forgot password button
+  const forgotPasswordBtn = document.getElementById('forgotPasswordBtn');
+  if (forgotPasswordBtn) {
+    forgotPasswordBtn.addEventListener('click', async () => {
+      isResetting = true; // Stop auto-refresh
+      
+      const data = await chrome.storage.local.get(['securityQuestion']);
+      
+      if (!data.securityQuestion) {
+        showStatus('No security question set. You must reset all data.', true);
+        const confirm = window.confirm('Reset all data including blocked websites? This cannot be undone.');
+        if (confirm) {
+          await chrome.storage.local.clear();
+          showStatus('✅ All data cleared. Please set a new password.');
+          isResetting = false;
+          await loadData();
+        } else {
+          isResetting = false;
+        }
+        return;
+      }
+      
+      // Show reset section
+      const questionTexts = {
+        pet: "What is your first pet's name?",
+        city: "What city were you born in?",
+        school: "What is your mother's maiden name?",
+        car: "What was your first car?",
+        teacher: "What is your favorite teacher's name?"
+      };
+      
+      document.getElementById('resetQuestionLabel').textContent = questionTexts[data.securityQuestion];
+      document.getElementById('mainSection').style.display = 'none';
+      document.getElementById('listsSection').style.display = 'none';
+      document.getElementById('timeSection').style.display = 'none';
+      document.getElementById('resetSection').style.display = 'block';
+    });
+  }
+
+  // Reset password button
+  const resetPasswordBtn = document.getElementById('resetPasswordBtn');
+  if (resetPasswordBtn) {
+    resetPasswordBtn.addEventListener('click', async () => {
+      const answer = document.getElementById('resetAnswer').value.trim().toLowerCase();
+      const newPass = document.getElementById('resetNewPassword').value;
+      const confirmPass = document.getElementById('resetConfirmPassword').value;
+      
+      if (!answer) {
+        showStatus('Please answer the security question', true);
+        return;
+      }
+      
+      if (!newPass || newPass.length < 4) {
+        showStatus('Password must be at least 4 characters', true);
+        return;
+      }
+      
+      if (newPass !== confirmPass) {
+        showStatus('Passwords do not match', true);
+        return;
+      }
+      
+      const data = await chrome.storage.local.get(['securityAnswerHash']);
+      const answerHash = await hashPassword(answer);
+      
+      if (answerHash !== data.securityAnswerHash) {
+        showStatus('❌ Incorrect answer to security question', true);
+        return;
+      }
+      
+      // Reset password
+      const newHash = await hashPassword(newPass);
+      await chrome.storage.local.set({ passwordHash: newHash });
+      passwordHash = newHash;
+      
+      document.getElementById('resetAnswer').value = '';
+      document.getElementById('resetNewPassword').value = '';
+      document.getElementById('resetConfirmPassword').value = '';
+      
+      showStatus('✅ Password reset successfully!');
+      isResetting = false; // Resume auto-refresh
+      await loadData();
+    });
+  }
+
+  // Cancel reset button
+  const cancelResetBtn = document.getElementById('cancelResetBtn');
+  if (cancelResetBtn) {
+    cancelResetBtn.addEventListener('click', () => {
+      document.getElementById('resetAnswer').value = '';
+      document.getElementById('resetNewPassword').value = '';
+      document.getElementById('resetConfirmPassword').value = '';
+      isResetting = false; // Resume auto-refresh
+      loadData();
+    });
+  }
+
+  // Initial load
+  console.log('Loading initial data...');
+  loadData();
+  
+  // Refresh every 2 seconds (but not during reset)
+  setInterval(() => {
+    if (!isResetting) {
+      loadData();
+    }
+  }, 2000);
+});// Background service worker
+let timeTracking = {};
+
+// Check if URL matches blocked site
+function matchesSite(url, blockedSite) {
+  try {
+    const urlObj = new URL(url);
+    const hostname = urlObj.hostname.replace(/^www\./, '');
+    const blockedDomain = blockedSite.replace(/^www\./, '');
+    
+    // Check if it's a domain block or specific URL block
+    if (blockedSite.includes('/')) {
+      // Specific URL block
+      return url.includes(blockedSite);
+    } else {
+      // Domain block
+      return hostname === blockedDomain || hostname.endsWith('.' + blockedDomain);
+    }
+  } catch (e) {
+    return false;
+  }
+}
+
+// Check if site should be blocked
+async function shouldBlockSite(url) {
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites', 'timeUsage']);
+  const blockedSites = data.blockedSites || [];
+  const timeLimitedSites = data.timeLimitedSites || [];
+  const timeUsage = data.timeUsage || {};
+  
+  // Check full blocks
+  for (const site of blockedSites) {
+    if (matchesSite(url, site)) {
+      return { blocked: true, reason: 'fully-blocked' };
+    }
+  }
+  
+  // Check time limits
+  const today = new Date().toDateString();
+  for (const site of timeLimitedSites) {
+    if (matchesSite(url, site.url)) {
+      const usage = timeUsage[site.url];
+      if (usage && usage.date === today && usage.time >= site.limit * 60) {
+        return { blocked: true, reason: 'time-exceeded', limit: site.limit };
+      }
+      return { blocked: false, timeLimited: true, site: site.url, limit: site.limit };
+    }
+  }
+  
+  return { blocked: false };
+}
+
+// Update time usage
+async function updateTimeUsage(url, seconds) {
+  const data = await chrome.storage.local.get(['timeLimitedSites', 'timeUsage']);
+  const timeLimitedSites = data.timeLimitedSites || [];
+  const timeUsage = data.timeUsage || {};
+  const today = new Date().toDateString();
+  
+  for (const site of timeLimitedSites) {
+    if (matchesSite(url, site.url)) {
+      if (!timeUsage[site.url] || timeUsage[site.url].date !== today) {
+        timeUsage[site.url] = { date: today, time: 0 };
+      }
+      timeUsage[site.url].time += seconds;
+      await chrome.storage.local.set({ timeUsage });
+      
+      // Check if limit exceeded
+      if (timeUsage[site.url].time >= site.limit * 60) {
+        // Reload the tab to trigger block
+        const tabs = await chrome.tabs.query({});
+        for (const tab of tabs) {
+          if (tab.url && matchesSite(tab.url, site.url)) {
+            chrome.tabs.reload(tab.id);
+          }
+        }
+      }
+      break;
+    }
+  }
+}
+
+// Track time on tabs
+chrome.tabs.onActivated.addListener(async (activeInfo) => {
+  const tab = await chrome.tabs.get(activeInfo.tabId);
+  if (tab.url) {
+    startTracking(activeInfo.tabId, tab.url);
+  }
+});
+
+chrome.tabs.onUpdated.addListener((tabId, changeInfo, tab) => {
+  if (changeInfo.url) {
+    startTracking(tabId, changeInfo.url);
+  }
+});
+
+chrome.windows.onFocusChanged.addListener((windowId) => {
+  if (windowId === chrome.windows.WINDOW_ID_NONE) {
+    stopAllTracking();
+  } else {
+    chrome.tabs.query({ active: true, windowId }, (tabs) => {
+      if (tabs[0]) {
+        startTracking(tabs[0].id, tabs[0].url);
+      }
+    });
+  }
+});
+
+function startTracking(tabId, url) {
+  stopAllTracking();
+  
+  shouldBlockSite(url).then(result => {
+    if (result.timeLimited) {
+      timeTracking[tabId] = {
+        url: url,
+        site: result.site,
+        startTime: Date.now()
+      };
+    }
+  });
+}
+
+function stopAllTracking() {
+  for (const tabId in timeTracking) {
+    const tracking = timeTracking[tabId];
+    const elapsed = Math.floor((Date.now() - tracking.startTime) / 1000);
+    if (elapsed > 0) {
+      updateTimeUsage(tracking.url, elapsed);
+    }
+  }
+  timeTracking = {};
+}
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  if (timeTracking[tabId]) {
+    const tracking = timeTracking[tabId];
+    const elapsed = Math.floor((Date.now() - tracking.startTime) / 1000);
+    if (elapsed > 0) {
+      updateTimeUsage(tracking.url, elapsed);
+    }
+    delete timeTracking[tabId];
+  }
+});
+
+// Periodic save (every 5 seconds)
+setInterval(() => {
+  for (const tabId in timeTracking) {
+    const tracking = timeTracking[tabId];
+    const elapsed = Math.floor((Date.now() - tracking.startTime) / 1000);
+    if (elapsed >= 5) {
+      updateTimeUsage(tracking.url, elapsed);
+      tracking.startTime = Date.now();
+    }
+  }
+}, 5000);
+
+// Handle navigation
+chrome.webNavigation.onBeforeNavigate.addListener(async (details) => {
+  if (details.frameId !== 0) return;
+  
+  const result = await shouldBlockSite(details.url);
+  if (result.blocked) {
+    chrome.tabs.update(details.tabId, {
+      url: chrome.runtime.getURL('blocked.html') + 
+           '?reason=' + result.reason + 
+           '&limit=' + (result.limit || '') +
+           '&url=' + encodeURIComponent(details.url)
+    });
+  }
+});
+
+// Message handler
+chrome.runtime.onMessage.addListener((request, sender, sendResponse) => {
+  if (request.action === 'checkBlock') {
+    shouldBlockSite(request.url).then(sendResponse);
+    return true;
+  }
+});// Blocked page script
+const params = new URLSearchParams(window.location.search);
+const reason = params.get('reason');
+const limit = params.get('limit');
+const url = params.get('url');
+
+document.getElementById('blockedUrl').textContent = decodeURIComponent(url || '');
+
+if (reason === 'time-exceeded') {
+  document.getElementById('title').textContent = 'Time Limit Exceeded';
+  document.getElementById('message').textContent = 
+    'You have reached your daily time limit for this website.';
+  document.getElementById('timeInfo').style.display = 'block';
+  document.getElementById('timeInfo').innerHTML = 
+    `<strong>Daily Limit:</strong> ${limit} minutes<br>` +
+    `<strong>Status:</strong> Limit reached for today<br>` +
+    `<em>This website will be accessible again tomorrow.</em>`;
+} else {
+  document.getElementById('message').textContent = 
+    'This website has been blocked by your website blocker extension.';
+}// Content script - checks if page should be blocked
+(async function() {
+  const response = await chrome.runtime.sendMessage({
+    action: 'checkBlock',
+    url: window.location.href
+  });
+  
+  if (response && response.blocked) {
+    window.stop();
+    document.documentElement.innerHTML = '';
+    window.location.href = chrome.runtime.getURL('blocked.html') + 
+      '?reason=' + response.reason + 
+      '&limit=' + (response.limit || '') +
+      '&url=' + encodeURIComponent(window.location.href);
+  }
+})();// Popup script - Simplified and debugged version
+console.log('Popup script loaded');
+
+let passwordHash = null;
+
+// Simple hash function
+async function hashPassword(password) {
+  const encoder = new TextEncoder();
+  const data = encoder.encode(password);
+  const hash = await crypto.subtle.digest('SHA-256', data);
+  return Array.from(new Uint8Array(hash))
+    .map(b => b.toString(16).padStart(2, '0'))
+    .join('');
+}
+
+// Show status message
+function showStatus(message, isError = false) {
+  const status = document.getElementById('status');
+  status.textContent = message;
+  status.className = 'status show ' + (isError ? 'error' : 'success');
+  setTimeout(() => {
+    status.className = 'status';
+  }, 3000);
+}
+
+// Load data
+async function loadData() {
+  try {
+    const data = await chrome.storage.local.get(['passwordHash', 'blockedSites', 'timeLimitedSites', 'timeUsage', 'securityQuestion', 'securityAnswerHash']);
+    passwordHash = data.passwordHash || null;
+    
+    console.log('Loaded data:', data);
+    
+    const passwordSetup = document.getElementById('passwordSetup');
+    const mainSection = document.getElementById('mainSection');
+    const listsSection = document.getElementById('listsSection');
+    const timeSection = document.getElementById('timeSection');
+    const resetSection = document.getElementById('resetSection');
+    
+    // Check if elements exist before accessing style
+    if (!passwordSetup || !mainSection || !listsSection || !timeSection || !resetSection) {
+      console.error('Some UI elements are missing');
+      return;
+    }
+    
+    if (!passwordHash) {
+      passwordSetup.style.display = 'block';
+      mainSection.style.display = 'none';
+      listsSection.style.display = 'none';
+      timeSection.style.display = 'none';
+      resetSection.style.display = 'none';
+    } else {
+      passwordSetup.style.display = 'none';
+      mainSection.style.display = 'block';
+      listsSection.style.display = 'block';
+      timeSection.style.display = 'block';
+      resetSection.style.display = 'none';
+    }
+    
+    displayBlockedSites(data.blockedSites || []);
+    displayTimeLimitedSites(data.timeLimitedSites || [], data.timeUsage || {});
+  } catch (error) {
+    console.error('Error loading data:', error);
+    showStatus('Error loading data: ' + error.message, true);
+  }
+}
+
+// Display blocked sites
+function displayBlockedSites(sites) {
+  const list = document.getElementById('blockedList');
+  if (sites.length === 0) {
+    list.innerHTML = '<p style="color: #999; font-size: 13px;">No blocked websites</p>';
+    return;
+  }
+  
+  list.innerHTML = sites.map(site => `
+    <div class="website-item">
+      <div class="website-info">
+        <div class="website-url">${escapeHtml(site)}</div>
+      </div>
+      <button class="delete" data-url="${escapeHtml(site)}" data-type="blocked">Remove</button>
+    </div>
+  `).join('');
+  
+  list.querySelectorAll('button.delete').forEach(btn => {
+    btn.addEventListener('click', () => removeSite(btn.dataset.url, btn.dataset.type));
+  });
+}
+
+// Display time-limited sites
+function displayTimeLimitedSites(sites, usage) {
+  const list = document.getElementById('timeLimitedList');
+  if (sites.length === 0) {
+    list.innerHTML = '<p style="color: #999; font-size: 13px;">No time-limited websites</p>';
+    return;
+  }
+  
+  const today = new Date().toDateString();
+  
+  list.innerHTML = sites.map(site => {
+    const used = (usage[site.url] && usage[site.url].date === today) 
+      ? Math.floor(usage[site.url].time / 60) 
+      : 0;
+    const remaining = Math.max(0, site.limit - used);
+    
+    return `
+      <div class="website-item">
+        <div class="website-info">
+          <div class="website-url">${escapeHtml(site.url)}</div>
+          <div class="time-info">Limit: ${site.limit}min/day | Used: ${used}min | Remaining: ${remaining}min</div>
+        </div>
+        <button class="delete" data-url="${escapeHtml(site.url)}" data-type="timelimited">Remove</button>
+      </div>
+    `;
+  }).join('');
+  
+  list.querySelectorAll('button.delete').forEach(btn => {
+    btn.addEventListener('click', () => removeSite(btn.dataset.url, btn.dataset.type));
+  });
+}
+
+// Escape HTML to prevent XSS
+function escapeHtml(text) {
+  const div = document.createElement('div');
+  div.textContent = text;
+  return div.innerHTML;
+}
+
+// Normalize URL
+function normalizeUrl(url) {
+  url = url.trim();
+  
+  // Remove protocol
+  url = url.replace(/^https?:\/\//, '');
+  
+  // Remove www
+  url = url.replace(/^www\./, '');
+  
+  // If it has a path, keep it (for specific page blocking)
+  // Otherwise just return the domain
+  if (url.includes('/')) {
+    // Check if it's just a trailing slash
+    if (url.endsWith('/')) {
+      url = url.slice(0, -1);
+    }
+    // If there's actual path content, keep full URL
+    if (url.split('/')[1]) {
+      return url;
+    }
+  }
+  
+  // Just domain
+  return url.split('/')[0];
+}
+
+// Add website function
+async function addWebsite() {
+  console.log('Add website clicked');
+  
+  if (!passwordHash) {
+    showStatus('Please set a password first', true);
+    return;
+  }
+  
+  let url = document.getElementById('websiteUrl').value.trim();
+  if (!url) {
+    showStatus('Please enter a URL', true);
+    return;
+  }
+  
+  url = normalizeUrl(url);
+  console.log('Normalized URL:', url);
+  
+  const blockType = document.querySelector('input[name="blockType"]:checked').value;
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites']);
+  
+  try {
+    if (blockType === 'full') {
+      const blockedSites = data.blockedSites || [];
+      if (blockedSites.includes(url)) {
+        showStatus('Website already blocked', true);
+        return;
+      }
+      blockedSites.push(url);
+      await chrome.storage.local.set({ blockedSites });
+      console.log('Blocked sites updated:', blockedSites);
+      showStatus('✅ Website blocked successfully!');
+    } else {
+      const timeLimit = parseInt(document.getElementById('timeLimit').value);
+      if (!timeLimit || timeLimit < 1) {
+        showStatus('Please enter a valid time limit', true);
+        return;
+      }
+      
+      const timeLimitedSites = data.timeLimitedSites || [];
+      if (timeLimitedSites.find(s => s.url === url)) {
+        showStatus('Website already has a time limit', true);
+        return;
+      }
+      
+      timeLimitedSites.push({ url, limit: timeLimit });
+      await chrome.storage.local.set({ timeLimitedSites });
+      console.log('Time limited sites updated:', timeLimitedSites);
+      showStatus('✅ Time limit set successfully!');
+    }
+    
+    document.getElementById('websiteUrl').value = '';
+    await loadData();
+  } catch (error) {
+    console.error('Error adding website:', error);
+    showStatus('Error: ' + error.message, true);
+  }
+}
+
+// Remove website
+async function removeSite(url, type) {
+  const password = prompt('Enter password to remove this website:');
+  if (!password) return;
+  
+  const hash = await hashPassword(password);
+  if (hash !== passwordHash) {
+    showStatus('❌ Incorrect password', true);
+    return;
+  }
+  
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites']);
+  
+  if (type === 'blocked') {
+    const blockedSites = (data.blockedSites || []).filter(s => s !== url);
+    await chrome.storage.local.set({ blockedSites });
+  } else {
+    const timeLimitedSites = (data.timeLimitedSites || []).filter(s => s.url !== url);
+    await chrome.storage.local.set({ timeLimitedSites });
+  }
+  
+  showStatus('✅ Website removed successfully!');
+  loadData();
+}
+
+// Wait for DOM to load
+window.addEventListener('DOMContentLoaded', function() {
+  console.log('DOM loaded, attaching listeners');
+  
+  let isResetting = false; // Flag to prevent auto-refresh during reset
+  
+  // Set password button
+  const setPasswordBtn = document.getElementById('setPasswordBtn');
+  if (setPasswordBtn) {
+    setPasswordBtn.addEventListener('click', async () => {
+      console.log('Set password clicked');
+      const newPass = document.getElementById('newPassword').value;
+      const confirmPass = document.getElementById('confirmPassword').value;
+      const securityQuestion = document.getElementById('securityQuestion').value;
+      const securityAnswer = document.getElementById('securityAnswer').value.trim();
+      
+      if (!newPass) {
+        showStatus('Please enter a password', true);
+        return;
+      }
+      
+      if (newPass.length < 4) {
+        showStatus('Password must be at least 4 characters', true);
+        return;
+      }
+      
+      if (newPass !== confirmPass) {
+        showStatus('Passwords do not match', true);
+        return;
+      }
+      
+      if (!securityQuestion) {
+        showStatus('Please select a security question', true);
+        return;
+      }
+      
+      if (!securityAnswer) {
+        showStatus('Please answer the security question', true);
+        return;
+      }
+      
+      try {
+        const hash = await hashPassword(newPass);
+        const answerHash = await hashPassword(securityAnswer.toLowerCase());
+        
+        await chrome.storage.local.set({ 
+          passwordHash: hash,
+          securityQuestion: securityQuestion,
+          securityAnswerHash: answerHash
+        });
+        
+        passwordHash = hash;
+        
+        document.getElementById('newPassword').value = '';
+        document.getElementById('confirmPassword').value = '';
+        document.getElementById('securityAnswer').value = '';
+        showStatus('✅ Password set successfully!');
+        await loadData();
+      } catch (error) {
+        console.error('Error setting password:', error);
+        showStatus('Error: ' + error.message, true);
+      }
+    });
+  }
+
+  // Add website button
+  const addBtn = document.getElementById('addBtn');
+  if (addBtn) {
+    addBtn.addEventListener('click', () => {
+      console.log('Add button clicked');
+      addWebsite();
+    });
+  }
+
+  // Add current website button
+  const addCurrentBtn = document.getElementById('addCurrentBtn');
+  if (addCurrentBtn) {
+    addCurrentBtn.addEventListener('click', async () => {
+      console.log('Add current website clicked');
+      try {
+        const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+        console.log('Current tab:', tab);
+        
+        if (tab && tab.url) {
+          if (tab.url.startsWith('chrome://') || tab.url.startsWith('chrome-extension://')) {
+            showStatus('Cannot block Chrome system pages', true);
+            return;
+          }
+          const url = new URL(tab.url);
+          document.getElementById('websiteUrl').value = url.hostname;
+          // Automatically add it
+          await addWebsite();
+        } else {
+          showStatus('No active tab found', true);
+        }
+      } catch (error) {
+        console.error('Error getting current tab:', error);
+        showStatus('Error: ' + error.message, true);
+      }
+    });
+  }
+
+  // Handle block type radio change
+  document.querySelectorAll('input[name="blockType"]').forEach(radio => {
+    radio.addEventListener('change', (e) => {
+      const timeLimitInput = document.getElementById('timeLimitInput');
+      if (e.target.value === 'time') {
+        timeLimitInput.classList.add('active');
+      } else {
+        timeLimitInput.classList.remove('active');
+      }
+    });
+  });
+
+  // Allow Enter key to add website
+  const websiteUrl = document.getElementById('websiteUrl');
+  if (websiteUrl) {
+    websiteUrl.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        addWebsite();
+      }
+    });
+  }
+
+  // Forgot password button
+  const forgotPasswordBtn = document.getElementById('forgotPasswordBtn');
+  if (forgotPasswordBtn) {
+    forgotPasswordBtn.addEventListener('click', async () => {
+      isResetting = true; // Stop auto-refresh
+      
+      const data = await chrome.storage.local.get(['securityQuestion']);
+      
+      if (!data.securityQuestion) {
+        showStatus('No security question set. You must reset all data.', true);
+        const confirm = window.confirm('Reset all data including blocked websites? This cannot be undone.');
+        if (confirm) {
+          await chrome.storage.local.clear();
+          showStatus('✅ All data cleared. Please set a new password.');
+          isResetting = false;
+          await loadData();
+        } else {
+          isResetting = false;
+        }
+        return;
+      }
+      
+      // Show reset section
+      const questionTexts = {
+        pet: "What is your first pet's name?",
+        city: "What city were you born in?",
+        school: "What is your mother's maiden name?",
+        car: "What was your first car?",
+        teacher: "What is your favorite teacher's name?"
+      };
+      
+      document.getElementById('resetQuestionLabel').textContent = questionTexts[data.securityQuestion];
+      document.getElementById('mainSection').style.display = 'none';
+      document.getElementById('listsSection').style.display = 'none';
+      document.getElementById('timeSection').style.display = 'none';
+      document.getElementById('resetSection').style.display = 'block';
+    });
+  }
+
+  // Reset password button
+  const resetPasswordBtn = document.getElementById('resetPasswordBtn');
+  if (resetPasswordBtn) {
+    resetPasswordBtn.addEventListener('click', async () => {
+      const answer = document.getElementById('resetAnswer').value.trim().toLowerCase();
+      const newPass = document.getElementById('resetNewPassword').value;
+      const confirmPass = document.getElementById('resetConfirmPassword').value;
+      
+      if (!answer) {
+        showStatus('Please answer the security question', true);
+        return;
+      }
+      
+      if (!newPass || newPass.length < 4) {
+        showStatus('Password must be at least 4 characters', true);
+        return;
+      }
+      
+      if (newPass !== confirmPass) {
+        showStatus('Passwords do not match', true);
+        return;
+      }
+      
+      const data = await chrome.storage.local.get(['securityAnswerHash']);
+      const answerHash = await hashPassword(answer);
+      
+      if (answerHash !== data.securityAnswerHash) {
+        showStatus('❌ Incorrect answer to security question', true);
+        return;
+      }
+      
+      // Reset password
+      const newHash = await hashPassword(newPass);
+      await chrome.storage.local.set({ passwordHash: newHash });
+      passwordHash = newHash;
+      
+      document.getElementById('resetAnswer').value = '';
+      document.getElementById('resetNewPassword').value = '';
+      document.getElementById('resetConfirmPassword').value = '';
+      
+      showStatus('✅ Password reset successfully!');
+      isResetting = false; // Resume auto-refresh
+      await loadData();
+    });
+  }
+
+  // Cancel reset button
+  const cancelResetBtn = document.getElementById('cancelResetBtn');
+  if (cancelResetBtn) {
+    cancelResetBtn.addEventListener('click', () => {
+      document.getElementById('resetAnswer').value = '';
+      document.getElementById('resetNewPassword').value = '';
+      document.getElementById('resetConfirmPassword').value = '';
+      isResetting = false; // Resume auto-refresh
+      loadData();
+    });
+  }
+
+  // Initial load
+  console.log('Loading initial data...');
+  loadData();
+  
+  // Refresh every 2 seconds (but not during reset)
+  setInterval(() => {
+    if (!isResetting) {
+      loadData();
+    }
+  }, 2000);
+});<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>Website Blocked</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      height: 100vh;
+      margin: 0;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    }
+    .container {
+      text-align: center;
+      background: white;
+      padding: 50px;
+      border-radius: 20px;
+      box-shadow: 0 10px 40px rgba(0,0,0,0.2);
+      max-width: 500px;
+    }
+    .icon {
+      font-size: 80px;
+      margin-bottom: 20px;
+    }
+    h1 {
+      color: #333;
+      margin: 0 0 15px 0;
+    }
+    p {
+      color: #666;
+      font-size: 16px;
+      line-height: 1.6;
+    }
+    .url {
+      background: #f5f5f5;
+      padding: 10px;
+      border-radius: 5px;
+      word-break: break-all;
+      margin: 20px 0;
+      font-family: monospace;
+      font-size: 14px;
+    }
+    .time-info {
+      background: #fff3cd;
+      border: 2px solid #ffc107;
+      padding: 15px;
+      border-radius: 10px;
+      margin: 20px 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="icon">🚫</div>
+    <h1 id="title">Website Blocked</h1>
+    <p id="message">This website has been blocked.</p>
+    <div class="url" id="blockedUrl"></div>
+    <div id="timeInfo" class="time-info" style="display: none;"></div>
+  </div>
+  
+  <script src="blocked.js"></script>
+</body>
+</html><!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <style>
+    body {
+      width: 400px;
+      padding: 15px;
+      font-family: Arial, sans-serif;
+      margin: 0;
+    }
+    h2 {
+      margin: 0 0 15px 0;
+      font-size: 18px;
+      color: #333;
+    }
+    .section {
+      margin-bottom: 20px;
+      padding-bottom: 15px;
+      border-bottom: 1px solid #ddd;
+    }
+    .section:last-child {
+      border-bottom: none;
+    }
+    input[type="text"], input[type="password"], input[type="number"] {
+      width: 100%;
+      padding: 8px;
+      margin: 5px 0;
+      box-sizing: border-box;
+      border: 1px solid #ccc;
+      border-radius: 4px;
+    }
+    button {
+      padding: 8px 15px;
+      margin: 5px 5px 5px 0;
+      background-color: #4CAF50;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    button:hover {
+      background-color: #45a049;
+    }
+    button.delete {
+      background-color: #f44336;
+      padding: 5px 10px;
+      font-size: 12px;
+    }
+    button.delete:hover {
+      background-color: #da190b;
+    }
+    .website-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 8px;
+      background-color: #f5f5f5;
+      margin: 5px 0;
+      border-radius: 4px;
+    }
+    .website-info {
+      flex: 1;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+    .website-url {
+      font-weight: bold;
+      font-size: 13px;
+    }
+    .time-info {
+      font-size: 11px;
+      color: #666;
+      margin-top: 3px;
+    }
+    .status {
+      margin: 10px 0;
+      padding: 8px;
+      border-radius: 4px;
+      font-size: 12px;
+      display: none;
+    }
+    .status.show {
+      display: block;
+    }
+    .status.success {
+      background-color: #d4edda;
+      color: #155724;
+    }
+    .status.error {
+      background-color: #f8d7da;
+      color: #721c24;
+    }
+    .label {
+      font-size: 12px;
+      font-weight: bold;
+      margin-top: 10px;
+      display: block;
+    }
+    .radio-group {
+      margin: 10px 0;
+    }
+    .radio-group label {
+      margin-right: 15px;
+      font-size: 13px;
+    }
+    .time-limit-input {
+      display: none;
+    }
+    .time-limit-input.active {
+      display: block;
+    }
+    #passwordSetup {
+      background-color: #fff3cd;
+      padding: 15px;
+      border-radius: 8px;
+      border: 2px solid #ffc107;
+    }
+  </style>
+</head>
+<body>
+  <div class="section">
+    <h2>🔒 Website Blocker</h2>
+    <div id="status" class="status"></div>
+    
+    <div id="passwordSetup">
+      <h3 style="margin-top: 0;">⚠️ Set Master Password First</h3>
+      <label class="label">Create Password:</label>
+      <input type="password" id="newPassword" placeholder="Enter password">
+      <input type="password" id="confirmPassword" placeholder="Confirm password">
+      
+      <label class="label">Security Question:</label>
+      <select id="securityQuestion" style="width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ccc; border-radius: 4px;">
+        <option value="">Choose a security question...</option>
+        <option value="pet">What is your first pet's name?</option>
+        <option value="city">What city were you born in?</option>
+        <option value="school">What is your mother's maiden name?</option>
+        <option value="car">What was your first car?</option>
+        <option value="teacher">What is your favorite teacher's name?</option>
+      </select>
+      
+      <input type="password" id="securityAnswer" placeholder="Your answer (hidden)">
+      
+      <button id="setPasswordBtn">Set Password</button>
+    </div>
+  </div>
+
+  <div class="section" id="mainSection" style="display: none;">
+    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
+      <h2 style="margin: 0;">Add Website</h2>
+      <button id="forgotPasswordBtn" style="background-color: #ff9800; font-size: 11px; padding: 5px 10px;">Forgot Password?</button>
+    </div>
+    <input type="text" id="websiteUrl" placeholder="Enter URL or domain (e.g., youtube.com)">
+    
+    <div class="radio-group">
+      <label><input type="radio" name="blockType" value="full" checked> Full Block</label>
+      <label><input type="radio" name="blockType" value="time"> Time Limit</label>
+    </div>
+    
+    <div id="timeLimitInput" class="time-limit-input">
+      <label class="label">Daily Time Limit (minutes):</label>
+      <input type="number" id="timeLimit" placeholder="e.g., 30" min="1" value="30">
+    </div>
+    
+    <button id="addCurrentBtn">➕ Add Current Website</button>
+    <button id="addBtn">➕ Add Website</button>
+  </div>
+
+  <div class="section" id="listsSection" style="display: none;">
+    <h2>Blocked Websites</h2>
+    <div id="blockedList"></div>
+  </div>
+
+  <div class="section" id="timeSection" style="display: none;">
+    <h2>Time-Limited Websites</h2>
+    <div id="timeLimitedList"></div>
+  </div>
+
+  <div class="section" id="resetSection" style="display: none;">
+    <h2>🔑 Reset Password</h2>
+    <p style="font-size: 13px; color: #666;">Answer your security question to reset your password.</p>
+    
+    <label class="label" id="resetQuestionLabel"></label>
+    <input type="password" id="resetAnswer" placeholder="Your answer (hidden)">
+    
+    <label class="label">New Password:</label>
+    <input type="password" id="resetNewPassword" placeholder="Enter new password">
+    <input type="password" id="resetConfirmPassword" placeholder="Confirm new password">
+    
+    <button id="resetPasswordBtn">Reset Password</button>
+    <button id="cancelResetBtn" style="background-color: #999;">Cancel</button>
+  </div>
+
+  <script src="popup.js"></script>
+</body>
+</html>{
+  "manifest_version": 3,
+  "name": "Website Blocker & Time Limiter",
+  "version": "1.0",
+  "description": "Block websites or set daily time limits with password protection",
+  "permissions": [
+    "storage",
+    "tabs",
+    "webNavigation",
+    "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_popup": "popup.html",
+    "default_icon": {
+      "16": "icon16.png",
+      "48": "icon48.png",
+      "128": "icon128.png"
+    }
+  },
+  "content_scripts": [
+    {
+      "matches": ["<all_urls>"],
+      "js": ["content.js"],
+      "run_at": "document_start"
+    }
+  ],
+  "icons": {
+    "16": "icon16.png",
+    "48": "icon48.png",
+    "128": "icon128.png"
+  }
+}
