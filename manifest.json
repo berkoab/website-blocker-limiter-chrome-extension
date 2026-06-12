@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Website Blocker & Time Limiter",
-  "version": "2.0",
+  "version": "2.1",
   "description": "Block distracting websites or set daily time limits. Password-protected to help you stay focused and productive.",
   "permissions": [
     "storage",

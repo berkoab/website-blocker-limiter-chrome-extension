@@ -127,7 +127,7 @@
     <div id="status" class="status"></div>
     
     <div id="passwordSetup">
-      <h3 style="margin-top: 0;">⚠️ Set Master Password First</h3>
+      <h3 style="margin-top: 0;">Set Master Password First</h3>
       <label class="label">Create Password:</label>
       <input type="password" id="newPassword" placeholder="Enter password">
       <input type="password" id="confirmPassword" placeholder="Confirm password">
@@ -150,23 +150,60 @@
 
   <div class="section" id="mainSection" style="display: none;">
     <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 10px;">
-      <h2 style="margin: 0;">Add Website</h2>
+      <h2 style="margin: 0;">Add Rule</h2>
       <button id="forgotPasswordBtn" style="background-color: #ff9800; font-size: 11px; padding: 5px 10px;">Forgot Password?</button>
     </div>
-    <input type="text" id="websiteUrl" placeholder="Enter URL or domain (e.g., youtube.com)">
-    
+
     <div class="radio-group">
       <label><input type="radio" name="blockType" value="full" checked> Full Block</label>
       <label><input type="radio" name="blockType" value="time"> Time Limit</label>
+      <label><input type="radio" name="blockType" value="group"> Group Limit</label>
     </div>
-    
-    <div id="timeLimitInput" class="time-limit-input">
-      <label class="label">Daily Time Limit (minutes):</label>
-      <input type="number" id="timeLimit" placeholder="e.g., 30" min="1" value="30">
+
+    <!-- Inputs for Full Block and Time Limit -->
+    <div id="singleSiteInputs">
+      <input type="text" id="websiteUrl" placeholder="Enter URL or domain (e.g., youtube.com)">
+      <div id="timeLimitInput" class="time-limit-input">
+        <label class="label">Daily Time Limit (minutes):</label>
+        <input type="number" id="timeLimit" placeholder="e.g., 30" min="1" value="30">
+      </div>
+      <button id="addCurrentBtn">Add Current Website</button>
+      <button id="addBtn">Add Website</button>
     </div>
-    
-    <button id="addCurrentBtn">➕ Add Current Website</button>
-    <button id="addBtn">➕ Add Website</button>
+
+    <!-- Inputs for Group Limit -->
+    <div id="groupInputs" style="display: none;">
+      <div class="radio-group" style="margin-bottom: 8px;">
+        <label><input type="radio" name="groupMode" value="new" checked> New group</label>
+        <label><input type="radio" name="groupMode" value="existing"> Add to existing group</label>
+      </div>
+
+      <!-- New group form -->
+      <div id="newGroupForm">
+        <label class="label">Group Name:</label>
+        <input type="text" id="groupName" placeholder="e.g., Social Media">
+        <label class="label">Websites in this group:</label>
+        <p style="font-size: 11px; color: #888; margin: 2px 0 5px;">Type a domain and press Enter or comma to add it.</p>
+        <div id="pendingGroupUrlsList" style="display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 4px;"></div>
+        <input type="text" id="groupUrl" placeholder="e.g., youtube.com, reddit.com" style="margin: 0;">
+        <label class="label">Daily Time Limit (minutes):</label>
+        <input type="number" id="groupTimeLimit" placeholder="e.g., 60" min="1" value="60">
+        <button id="createGroupBtn">Create Group</button>
+      </div>
+
+      <!-- Add to existing group form -->
+      <div id="existingGroupForm" style="display: none;">
+        <label class="label">Select group:</label>
+        <select id="existingGroupSelect" style="width: 100%; padding: 8px; margin: 5px 0; border: 1px solid #ccc; border-radius: 4px;">
+          <option value="">Choose a group...</option>
+        </select>
+        <label class="label">Website to add:</label>
+        <div style="display: flex; gap: 5px; margin: 5px 0;">
+          <input type="text" id="addToGroupUrl" placeholder="e.g., reddit.com" style="flex: 1; margin: 0;">
+          <button id="addToGroupBtn" style="margin: 0; white-space: nowrap; padding: 8px 10px;">Add</button>
+        </div>
+      </div>
+    </div>
   </div>
 
   <div class="section" id="listsSection" style="display: none;">
@@ -181,28 +218,11 @@
 
   <div class="section" id="groupSection" style="display: none;">
     <h2>Group Time Limits</h2>
-    <p style="font-size: 12px; color: #666; margin: 0 0 10px 0;">Limit total time spent across a set of websites collectively.</p>
-
-    <label class="label">Group Name:</label>
-    <input type="text" id="groupName" placeholder="e.g., Social Media">
-
-    <label class="label">Add websites to group:</label>
-    <div style="display: flex; gap: 5px; margin: 5px 0;">
-      <input type="text" id="groupUrl" placeholder="e.g., youtube.com" style="flex: 1; margin: 0;">
-      <button id="addGroupUrlBtn" style="margin: 0; white-space: nowrap; padding: 8px 10px;">Add</button>
-    </div>
-    <div id="pendingGroupUrlsList"></div>
-
-    <label class="label">Daily Time Limit (minutes):</label>
-    <input type="number" id="groupTimeLimit" placeholder="e.g., 60" min="1" value="60">
-
-    <button id="createGroupBtn">➕ Create Group</button>
-
-    <div id="groupsList" style="margin-top: 10px;"></div>
+    <div id="groupsList"></div>
   </div>
 
   <div class="section" id="resetSection" style="display: none;">
-    <h2>🔑 Reset Password</h2>
+    <h2>Reset Password</h2>
     <p style="font-size: 13px; color: #666;">Answer your security question to reset your password.</p>
     
     <label class="label" id="resetQuestionLabel"></label>
@@ -219,7 +239,7 @@
   <!-- Password confirmation modal -->
   <div id="passwordModal" style="display: none; position: fixed; top: 0; left: 0; width: 100%; height: 100%; background: rgba(0,0,0,0.5); z-index: 1000; justify-content: center; align-items: center;">
     <div style="background: white; padding: 25px; border-radius: 10px; width: 300px; box-shadow: 0 5px 20px rgba(0,0,0,0.3);">
-      <h3 style="margin-top: 0;">🔒 Confirm Password</h3>
+      <h3 style="margin-top: 0;">Confirm Password</h3>
       <p style="font-size: 13px; color: #666; margin: 10px 0;">Enter your password to remove:</p>
       <div style="font-weight: bold; background: #f5f5f5; padding: 8px; border-radius: 4px; margin: 10px 0; font-size: 12px; word-break: break-all;" id="removeUrl"></div>
       <input type="password" id="modalConfirmPassword" placeholder="Enter password" style="width: 100%; padding: 10px; margin: 10px 0; box-sizing: border-box; border: 1px solid #ccc; border-radius: 4px;">

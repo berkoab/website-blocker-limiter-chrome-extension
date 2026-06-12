@@ -144,6 +144,14 @@ function displayGroups(groups, groupTimeUsage) {
       : 0;
     const remaining = Math.max(0, group.limit - used);
 
+    const urlTags = group.urls.map(u => `
+      <span style="display: inline-flex; align-items: center; background: #e0e0e0; border-radius: 3px; padding: 1px 5px; font-size: 11px; margin: 2px;">
+        ${escapeHtml(u)}
+        <button class="remove-group-url" data-group-id="${escapeHtml(group.id)}" data-url="${escapeHtml(u)}"
+          style="background: none; border: none; color: #888; cursor: pointer; padding: 0 0 0 4px; font-size: 12px; line-height: 1;">×</button>
+      </span>
+    `).join('');
+
     return `
       <div class="website-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
         <div style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
@@ -151,7 +159,7 @@ function displayGroups(groups, groupTimeUsage) {
           <button class="delete" data-group-id="${escapeHtml(group.id)}">Remove</button>
         </div>
         <div class="time-info">Limit: ${group.limit}min/day | Used: ${used}min | Remaining: ${remaining}min</div>
-        <div style="font-size: 11px; color: #888;">Sites: ${group.urls.map(u => escapeHtml(u)).join(', ')}</div>
+        <div style="flex-wrap: wrap; display: flex; gap: 2px; margin-top: 2px;">${urlTags}</div>
       </div>
     `;
   }).join('');
@@ -159,9 +167,36 @@ function displayGroups(groups, groupTimeUsage) {
   list.querySelectorAll('button.delete[data-group-id]').forEach(btn => {
     btn.addEventListener('click', () => removeGroup(btn.dataset.groupId));
   });
+
+  list.querySelectorAll('button.remove-group-url').forEach(btn => {
+    btn.addEventListener('click', () => removeUrlFromGroup(btn.dataset.groupId, btn.dataset.url));
+  });
 }
 
-// Render the pending URL list while building a new group
+// Remove a single URL from a group — password protected
+function removeUrlFromGroup(groupId, url) {
+  const modal = document.getElementById('passwordModal');
+  const removeUrlEl = document.getElementById('removeUrl');
+  const confirmPasswordInput = document.getElementById('modalConfirmPassword');
+
+  chrome.storage.local.get(['timeLimitedGroups']).then(data => {
+    const group = (data.timeLimitedGroups || []).find(g => g.id === groupId);
+    if (!group) return;
+
+    if (group.urls.length <= 1) {
+      showStatus('A group must have at least one website. Remove the group instead.', true);
+      return;
+    }
+
+    removeUrlEl.textContent = `${url} (from group "${group.name}")`;
+    confirmPasswordInput.value = '';
+    modal.style.display = 'flex';
+    setTimeout(() => confirmPasswordInput.focus(), 100);
+    window.pendingRemoval = { type: 'groupUrl', groupId, url };
+  });
+}
+
+// Render the pending URL list while building a new group (inline chips)
 function renderPendingGroupUrls() {
   const container = document.getElementById('pendingGroupUrlsList');
   if (!container) return;
@@ -172,10 +207,10 @@ function renderPendingGroupUrls() {
   }
 
   container.innerHTML = pendingGroupUrls.map((url, i) => `
-    <div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #f5f5f5; border-radius: 4px; margin: 3px 0;">
-      <span style="font-size: 12px;">${escapeHtml(url)}</span>
-      <button class="delete" style="padding: 2px 8px; font-size: 11px;" data-index="${i}">×</button>
-    </div>
+    <span style="display: inline-flex; align-items: center; background: #e8f0fe; border: 1px solid #aac4f7; border-radius: 12px; padding: 2px 8px; font-size: 12px;">
+      ${escapeHtml(url)}
+      <button data-index="${i}" style="background: none; border: none; color: #555; cursor: pointer; padding: 0 0 0 5px; font-size: 13px; line-height: 1;">×</button>
+    </span>
   `).join('');
 
   container.querySelectorAll('button.delete').forEach(btn => {
@@ -191,6 +226,17 @@ async function createGroup() {
   if (!passwordHash) {
     showStatus('Please set a password first', true);
     return;
+  }
+
+  // Flush any URL still typed but not yet tagged
+  const groupUrlInput = document.getElementById('groupUrl');
+  if (groupUrlInput) {
+    const url = normalizeUrl(groupUrlInput.value);
+    if (url && !pendingGroupUrls.includes(url)) {
+      pendingGroupUrls.push(url);
+      groupUrlInput.value = '';
+      renderPendingGroupUrls();
+    }
   }
 
   const name = document.getElementById('groupName').value.trim();
@@ -227,7 +273,7 @@ async function createGroup() {
     document.getElementById('groupTimeLimit').value = '60';
     pendingGroupUrls = [];
     renderPendingGroupUrls();
-    showStatus('✅ Group created successfully!');
+    showStatus('Group created successfully!');
     await loadData();
   } catch (error) {
     console.error('Error creating group:', error);
@@ -318,7 +364,7 @@ async function addWebsite() {
       blockedSites.push(url);
       await chrome.storage.local.set({ blockedSites });
       console.log('Blocked sites updated:', blockedSites);
-      showStatus('✅ Website blocked successfully!');
+      showStatus('Website blocked successfully!');
     } else {
       const timeLimit = parseInt(document.getElementById('timeLimit').value);
       if (!timeLimit || timeLimit < 1) {
@@ -335,7 +381,7 @@ async function addWebsite() {
       timeLimitedSites.push({ url, limit: timeLimit });
       await chrome.storage.local.set({ timeLimitedSites });
       console.log('Time limited sites updated:', timeLimitedSites);
-      showStatus('✅ Time limit set successfully!');
+      showStatus('Time limit set successfully!');
     }
     
     document.getElementById('websiteUrl').value = '';
@@ -404,7 +450,7 @@ function setupPasswordModal() {
     console.log('Password hash matches:', hash === passwordHash);
     
     if (hash !== passwordHash) {
-      showStatus('❌ Incorrect password', true);
+      showStatus('Incorrect password', true);
       confirmPasswordInput.value = '';
       confirmPasswordInput.focus();
       return;
@@ -425,17 +471,25 @@ function setupPasswordModal() {
     if (type === 'blocked') {
       const blockedSites = (data.blockedSites || []).filter(s => s !== url);
       await chrome.storage.local.set({ blockedSites });
-      showStatus('✅ Website removed successfully!');
+      showStatus('Website removed successfully!');
     } else if (type === 'timelimited') {
       const timeLimitedSites = (data.timeLimitedSites || []).filter(s => s.url !== url);
       await chrome.storage.local.set({ timeLimitedSites });
-      showStatus('✅ Website removed successfully!');
+      showStatus('Website removed successfully!');
     } else if (type === 'group') {
       const timeLimitedGroups = (data.timeLimitedGroups || []).filter(g => g.id !== id);
       const groupTimeUsage = data.groupTimeUsage || {};
       delete groupTimeUsage[id];
       await chrome.storage.local.set({ timeLimitedGroups, groupTimeUsage });
-      showStatus('✅ Group removed successfully!');
+      showStatus('Group removed successfully!');
+    } else if (type === 'groupUrl') {
+      const timeLimitedGroups = data.timeLimitedGroups || [];
+      const group = timeLimitedGroups.find(g => g.id === window.pendingRemoval.groupId);
+      if (group) {
+        group.urls = group.urls.filter(u => u !== window.pendingRemoval.url);
+        await chrome.storage.local.set({ timeLimitedGroups });
+      }
+      showStatus('Website removed from group!');
     }
     
     modal.style.display = 'none';
@@ -533,7 +587,7 @@ window.addEventListener('DOMContentLoaded', function() {
         document.getElementById('newPassword').value = '';
         document.getElementById('confirmPassword').value = '';
         document.getElementById('securityAnswer').value = '';
-        showStatus('✅ Password set successfully!');
+        showStatus('Password set successfully!');
         await loadData();
       } catch (error) {
         console.error('Error setting password:', error);
@@ -579,33 +633,28 @@ window.addEventListener('DOMContentLoaded', function() {
     });
   }
 
-  // Add URL to pending group list
-  const addGroupUrlBtn = document.getElementById('addGroupUrlBtn');
-  if (addGroupUrlBtn) {
-    addGroupUrlBtn.addEventListener('click', () => {
-      const input = document.getElementById('groupUrl');
-      const url = normalizeUrl(input.value);
-      if (!url) {
-        showStatus('Please enter a URL to add to the group', true);
-        return;
-      }
-      if (pendingGroupUrls.includes(url)) {
-        showStatus('URL already added to this group', true);
-        return;
-      }
-      pendingGroupUrls.push(url);
-      input.value = '';
-      renderPendingGroupUrls();
-    });
-  }
-
-  // Allow Enter in group URL input to add URL
+  // Auto-tag on Enter or comma in the group URL input
   const groupUrlInput = document.getElementById('groupUrl');
   if (groupUrlInput) {
-    groupUrlInput.addEventListener('keypress', (e) => {
-      if (e.key === 'Enter') {
+    groupUrlInput.addEventListener('keydown', (e) => {
+      if (e.key === 'Enter' || e.key === ',') {
         e.preventDefault();
-        document.getElementById('addGroupUrlBtn').click();
+        const url = normalizeUrl(groupUrlInput.value);
+        if (!url) return;
+        if (!pendingGroupUrls.includes(url)) {
+          pendingGroupUrls.push(url);
+          renderPendingGroupUrls();
+        }
+        groupUrlInput.value = '';
+      }
+    });
+    // Also tag anything remaining in the field when Create Group is clicked
+    groupUrlInput.addEventListener('blur', () => {
+      const url = normalizeUrl(groupUrlInput.value);
+      if (url && !pendingGroupUrls.includes(url)) {
+        pendingGroupUrls.push(url);
+        renderPendingGroupUrls();
+        groupUrlInput.value = '';
       }
     });
   }
@@ -616,14 +665,90 @@ window.addEventListener('DOMContentLoaded', function() {
     createGroupBtn.addEventListener('click', createGroup);
   }
 
+  // Group mode radio (new vs existing)
+  document.querySelectorAll('input[name="groupMode"]').forEach(radio => {
+    radio.addEventListener('change', async (e) => {
+      const newGroupForm = document.getElementById('newGroupForm');
+      const existingGroupForm = document.getElementById('existingGroupForm');
+      if (e.target.value === 'existing') {
+        newGroupForm.style.display = 'none';
+        existingGroupForm.style.display = 'block';
+        // Populate the dropdown with current groups
+        const data = await chrome.storage.local.get(['timeLimitedGroups']);
+        const groups = data.timeLimitedGroups || [];
+        const select = document.getElementById('existingGroupSelect');
+        select.innerHTML = '<option value="">Choose a group...</option>' +
+          groups.map(g => `<option value="${escapeHtml(g.id)}">${escapeHtml(g.name)}</option>`).join('');
+      } else {
+        newGroupForm.style.display = 'block';
+        existingGroupForm.style.display = 'none';
+      }
+    });
+  });
+
+  // Add to existing group button
+  const addToGroupBtn = document.getElementById('addToGroupBtn');
+  if (addToGroupBtn) {
+    addToGroupBtn.addEventListener('click', async () => {
+      const groupId = document.getElementById('existingGroupSelect').value;
+      if (!groupId) {
+        showStatus('Please select a group', true);
+        return;
+      }
+      const url = normalizeUrl(document.getElementById('addToGroupUrl').value);
+      if (!url) {
+        showStatus('Please enter a URL', true);
+        return;
+      }
+
+      const data = await chrome.storage.local.get(['timeLimitedGroups']);
+      const groups = data.timeLimitedGroups || [];
+      const group = groups.find(g => g.id === groupId);
+      if (!group) return;
+
+      if (group.urls.includes(url)) {
+        showStatus('Website is already in this group', true);
+        return;
+      }
+
+      group.urls.push(url);
+      await chrome.storage.local.set({ timeLimitedGroups: groups });
+      document.getElementById('addToGroupUrl').value = '';
+      showStatus(`Added ${url} to "${group.name}"`);
+      await loadData();
+    });
+  }
+
+  // Allow Enter in add-to-group URL input
+  const addToGroupUrl = document.getElementById('addToGroupUrl');
+  if (addToGroupUrl) {
+    addToGroupUrl.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('addToGroupBtn').click();
+      }
+    });
+  }
+
   // Handle block type radio change
   document.querySelectorAll('input[name="blockType"]').forEach(radio => {
     radio.addEventListener('change', (e) => {
       const timeLimitInput = document.getElementById('timeLimitInput');
-      if (e.target.value === 'time') {
-        timeLimitInput.classList.add('active');
-      } else {
+      const singleSiteInputs = document.getElementById('singleSiteInputs');
+      const groupInputs = document.getElementById('groupInputs');
+
+      if (e.target.value === 'group') {
+        singleSiteInputs.style.display = 'none';
+        groupInputs.style.display = 'block';
         timeLimitInput.classList.remove('active');
+      } else {
+        singleSiteInputs.style.display = 'block';
+        groupInputs.style.display = 'none';
+        if (e.target.value === 'time') {
+          timeLimitInput.classList.add('active');
+        } else {
+          timeLimitInput.classList.remove('active');
+        }
       }
     });
   });
@@ -651,7 +776,7 @@ window.addEventListener('DOMContentLoaded', function() {
         const confirm = window.confirm('Reset all data including blocked websites? This cannot be undone.');
         if (confirm) {
           await chrome.storage.local.clear();
-          showStatus('✅ All data cleared. Please set a new password.');
+          showStatus('All data cleared. Please set a new password.');
           isResetting = false;
           await loadData();
         } else {
@@ -673,6 +798,7 @@ window.addEventListener('DOMContentLoaded', function() {
       document.getElementById('mainSection').style.display = 'none';
       document.getElementById('listsSection').style.display = 'none';
       document.getElementById('timeSection').style.display = 'none';
+      document.getElementById('groupSection').style.display = 'none';
       document.getElementById('resetSection').style.display = 'block';
     });
   }
@@ -704,7 +830,7 @@ window.addEventListener('DOMContentLoaded', function() {
       const answerHash = await hashPassword(answer);
       
       if (answerHash !== data.securityAnswerHash) {
-        showStatus('❌ Incorrect answer to security question', true);
+        showStatus('Incorrect answer to security question', true);
         return;
       }
       
@@ -717,7 +843,7 @@ window.addEventListener('DOMContentLoaded', function() {
       document.getElementById('resetNewPassword').value = '';
       document.getElementById('resetConfirmPassword').value = '';
       
-      showStatus('✅ Password reset successfully!');
+      showStatus('Password reset successfully!');
       isResetting = false; // Resume auto-refresh
       await loadData();
     });
