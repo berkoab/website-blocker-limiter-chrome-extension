@@ -23,10 +23,12 @@ function matchesSite(url, blockedSite) {
 
 // Check if site should be blocked
 async function shouldBlockSite(url) {
-  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites', 'timeUsage']);
+  const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites', 'timeUsage', 'timeLimitedGroups', 'groupTimeUsage']);
   const blockedSites = data.blockedSites || [];
   const timeLimitedSites = data.timeLimitedSites || [];
   const timeUsage = data.timeUsage || {};
+  const timeLimitedGroups = data.timeLimitedGroups || [];
+  const groupTimeUsage = data.groupTimeUsage || {};
   
   // Check full blocks
   for (const site of blockedSites) {
@@ -46,36 +48,75 @@ async function shouldBlockSite(url) {
       return { blocked: false, timeLimited: true, site: site.url, limit: site.limit };
     }
   }
+
+  // Check group time limits
+  for (const group of timeLimitedGroups) {
+    if (group.urls.some(u => matchesSite(url, u))) {
+      const usage = groupTimeUsage[group.id];
+      if (usage && usage.date === today && usage.time >= group.limit * 60) {
+        return { blocked: true, reason: 'time-exceeded', limit: group.limit };
+      }
+      return { blocked: false, timeLimited: true, site: url, groupId: group.id, limit: group.limit };
+    }
+  }
   
   return { blocked: false };
 }
 
 // Update time usage
 async function updateTimeUsage(url, seconds) {
-  const data = await chrome.storage.local.get(['timeLimitedSites', 'timeUsage']);
+  const data = await chrome.storage.local.get(['timeLimitedSites', 'timeUsage', 'timeLimitedGroups', 'groupTimeUsage']);
   const timeLimitedSites = data.timeLimitedSites || [];
   const timeUsage = data.timeUsage || {};
+  const timeLimitedGroups = data.timeLimitedGroups || [];
+  const groupTimeUsage = data.groupTimeUsage || {};
   const today = new Date().toDateString();
-  
+
+  let matchedSite = null;
+  let matchedGroup = null;
+
   for (const site of timeLimitedSites) {
     if (matchesSite(url, site.url)) {
       if (!timeUsage[site.url] || timeUsage[site.url].date !== today) {
         timeUsage[site.url] = { date: today, time: 0 };
       }
       timeUsage[site.url].time += seconds;
-      await chrome.storage.local.set({ timeUsage });
-      
-      // Check if limit exceeded
-      if (timeUsage[site.url].time >= site.limit * 60) {
-        // Reload the tab to trigger block
-        const tabs = await chrome.tabs.query({});
-        for (const tab of tabs) {
-          if (tab.url && matchesSite(tab.url, site.url)) {
-            chrome.tabs.reload(tab.id);
-          }
-        }
-      }
+      matchedSite = site;
       break;
+    }
+  }
+
+  for (const group of timeLimitedGroups) {
+    if (group.urls.some(u => matchesSite(url, u))) {
+      if (!groupTimeUsage[group.id] || groupTimeUsage[group.id].date !== today) {
+        groupTimeUsage[group.id] = { date: today, time: 0 };
+      }
+      groupTimeUsage[group.id].time += seconds;
+      matchedGroup = group;
+      break;
+    }
+  }
+
+  await chrome.storage.local.set({ timeUsage, groupTimeUsage });
+
+  // Reload tabs whose limit has been exceeded
+  if (matchedSite || matchedGroup) {
+    const tabs = await chrome.tabs.query({});
+    for (const tab of tabs) {
+      if (!tab.url) continue;
+      let shouldReload = false;
+      if (matchedSite && matchesSite(tab.url, matchedSite.url) &&
+          timeUsage[matchedSite.url]?.time >= matchedSite.limit * 60) {
+        shouldReload = true;
+      }
+      if (!shouldReload && matchedGroup &&
+          matchedGroup.urls.some(u => matchesSite(tab.url, u)) &&
+          groupTimeUsage[matchedGroup.id]?.time >= matchedGroup.limit * 60) {
+        shouldReload = true;
+      }
+      if (shouldReload) {
+        chrome.tabs.reload(tab.id);
+      }
     }
   }
 }

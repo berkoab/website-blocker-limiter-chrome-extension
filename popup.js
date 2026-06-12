@@ -26,7 +26,7 @@ function showStatus(message, isError = false) {
 // Load data
 async function loadData() {
   try {
-    const data = await chrome.storage.local.get(['passwordHash', 'blockedSites', 'timeLimitedSites', 'timeUsage', 'securityQuestion', 'securityAnswerHash']);
+    const data = await chrome.storage.local.get(['passwordHash', 'blockedSites', 'timeLimitedSites', 'timeUsage', 'timeLimitedGroups', 'groupTimeUsage', 'securityQuestion', 'securityAnswerHash']);
     passwordHash = data.passwordHash || null;
     
     console.log('Loaded data:', data);
@@ -35,10 +35,11 @@ async function loadData() {
     const mainSection = document.getElementById('mainSection');
     const listsSection = document.getElementById('listsSection');
     const timeSection = document.getElementById('timeSection');
+    const groupSection = document.getElementById('groupSection');
     const resetSection = document.getElementById('resetSection');
     
     // Check if elements exist before accessing style
-    if (!passwordSetup || !mainSection || !listsSection || !timeSection || !resetSection) {
+    if (!passwordSetup || !mainSection || !listsSection || !timeSection || !groupSection || !resetSection) {
       console.error('Some UI elements are missing');
       return;
     }
@@ -48,17 +49,20 @@ async function loadData() {
       mainSection.style.display = 'none';
       listsSection.style.display = 'none';
       timeSection.style.display = 'none';
+      groupSection.style.display = 'none';
       resetSection.style.display = 'none';
     } else {
       passwordSetup.style.display = 'none';
       mainSection.style.display = 'block';
       listsSection.style.display = 'block';
       timeSection.style.display = 'block';
+      groupSection.style.display = 'block';
       resetSection.style.display = 'none';
     }
     
     displayBlockedSites(data.blockedSites || []);
     displayTimeLimitedSites(data.timeLimitedSites || [], data.timeUsage || {});
+    displayGroups(data.timeLimitedGroups || [], data.groupTimeUsage || {});
   } catch (error) {
     console.error('Error loading data:', error);
     showStatus('Error loading data: ' + error.message, true);
@@ -116,6 +120,136 @@ function displayTimeLimitedSites(sites, usage) {
   
   list.querySelectorAll('button.delete').forEach(btn => {
     btn.addEventListener('click', () => removeSite(btn.dataset.url, btn.dataset.type));
+  });
+}
+
+// State for building a new group's URL list
+let pendingGroupUrls = [];
+
+// Display groups
+function displayGroups(groups, groupTimeUsage) {
+  const list = document.getElementById('groupsList');
+  if (!list) return;
+
+  if (groups.length === 0) {
+    list.innerHTML = '<p style="color: #999; font-size: 13px;">No group time limits</p>';
+    return;
+  }
+
+  const today = new Date().toDateString();
+
+  list.innerHTML = groups.map(group => {
+    const used = (groupTimeUsage[group.id] && groupTimeUsage[group.id].date === today)
+      ? Math.floor(groupTimeUsage[group.id].time / 60)
+      : 0;
+    const remaining = Math.max(0, group.limit - used);
+
+    return `
+      <div class="website-item" style="flex-direction: column; align-items: flex-start; gap: 4px;">
+        <div style="display: flex; justify-content: space-between; width: 100%; align-items: center;">
+          <div class="website-url">${escapeHtml(group.name)}</div>
+          <button class="delete" data-group-id="${escapeHtml(group.id)}">Remove</button>
+        </div>
+        <div class="time-info">Limit: ${group.limit}min/day | Used: ${used}min | Remaining: ${remaining}min</div>
+        <div style="font-size: 11px; color: #888;">Sites: ${group.urls.map(u => escapeHtml(u)).join(', ')}</div>
+      </div>
+    `;
+  }).join('');
+
+  list.querySelectorAll('button.delete[data-group-id]').forEach(btn => {
+    btn.addEventListener('click', () => removeGroup(btn.dataset.groupId));
+  });
+}
+
+// Render the pending URL list while building a new group
+function renderPendingGroupUrls() {
+  const container = document.getElementById('pendingGroupUrlsList');
+  if (!container) return;
+
+  if (pendingGroupUrls.length === 0) {
+    container.innerHTML = '';
+    return;
+  }
+
+  container.innerHTML = pendingGroupUrls.map((url, i) => `
+    <div style="display: flex; align-items: center; justify-content: space-between; padding: 4px 8px; background: #f5f5f5; border-radius: 4px; margin: 3px 0;">
+      <span style="font-size: 12px;">${escapeHtml(url)}</span>
+      <button class="delete" style="padding: 2px 8px; font-size: 11px;" data-index="${i}">×</button>
+    </div>
+  `).join('');
+
+  container.querySelectorAll('button.delete').forEach(btn => {
+    btn.addEventListener('click', () => {
+      pendingGroupUrls.splice(parseInt(btn.dataset.index), 1);
+      renderPendingGroupUrls();
+    });
+  });
+}
+
+// Create a new group
+async function createGroup() {
+  if (!passwordHash) {
+    showStatus('Please set a password first', true);
+    return;
+  }
+
+  const name = document.getElementById('groupName').value.trim();
+  if (!name) {
+    showStatus('Please enter a group name', true);
+    return;
+  }
+
+  if (pendingGroupUrls.length === 0) {
+    showStatus('Please add at least one website to the group', true);
+    return;
+  }
+
+  const timeLimit = parseInt(document.getElementById('groupTimeLimit').value);
+  if (!timeLimit || timeLimit < 1) {
+    showStatus('Please enter a valid time limit', true);
+    return;
+  }
+
+  try {
+    const data = await chrome.storage.local.get(['timeLimitedGroups']);
+    const groups = data.timeLimitedGroups || [];
+
+    if (groups.find(g => g.name === name)) {
+      showStatus('A group with this name already exists', true);
+      return;
+    }
+
+    groups.push({ id: Date.now().toString(), name, urls: [...pendingGroupUrls], limit: timeLimit });
+    await chrome.storage.local.set({ timeLimitedGroups: groups });
+
+    document.getElementById('groupName').value = '';
+    document.getElementById('groupUrl').value = '';
+    document.getElementById('groupTimeLimit').value = '60';
+    pendingGroupUrls = [];
+    renderPendingGroupUrls();
+    showStatus('✅ Group created successfully!');
+    await loadData();
+  } catch (error) {
+    console.error('Error creating group:', error);
+    showStatus('Error: ' + error.message, true);
+  }
+}
+
+// Remove a group (prompts for password)
+function removeGroup(groupId) {
+  const modal = document.getElementById('passwordModal');
+  const removeUrlEl = document.getElementById('removeUrl');
+  const confirmPasswordInput = document.getElementById('modalConfirmPassword');
+
+  chrome.storage.local.get(['timeLimitedGroups']).then(data => {
+    const group = (data.timeLimitedGroups || []).find(g => g.id === groupId);
+    if (!group) return;
+
+    removeUrlEl.textContent = 'Group: ' + group.name;
+    confirmPasswordInput.value = '';
+    modal.style.display = 'flex';
+    setTimeout(() => confirmPasswordInput.focus(), 100);
+    window.pendingRemoval = { type: 'group', id: groupId };
   });
 }
 
@@ -276,7 +410,7 @@ function setupPasswordModal() {
       return;
     }
     
-    // Password correct, remove the site
+    // Password correct, remove the site/group
     if (!window.pendingRemoval) {
       console.error('No pending removal found');
       showStatus('Error: No pending removal', true);
@@ -284,19 +418,26 @@ function setupPasswordModal() {
       return;
     }
     
-    const { url, type } = window.pendingRemoval;
-    console.log('Removing:', url, type);
-    const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites']);
+    const { url, type, id } = window.pendingRemoval;
+    console.log('Removing:', url || id, type);
+    const data = await chrome.storage.local.get(['blockedSites', 'timeLimitedSites', 'timeLimitedGroups', 'groupTimeUsage']);
     
     if (type === 'blocked') {
       const blockedSites = (data.blockedSites || []).filter(s => s !== url);
       await chrome.storage.local.set({ blockedSites });
-    } else {
+      showStatus('✅ Website removed successfully!');
+    } else if (type === 'timelimited') {
       const timeLimitedSites = (data.timeLimitedSites || []).filter(s => s.url !== url);
       await chrome.storage.local.set({ timeLimitedSites });
+      showStatus('✅ Website removed successfully!');
+    } else if (type === 'group') {
+      const timeLimitedGroups = (data.timeLimitedGroups || []).filter(g => g.id !== id);
+      const groupTimeUsage = data.groupTimeUsage || {};
+      delete groupTimeUsage[id];
+      await chrome.storage.local.set({ timeLimitedGroups, groupTimeUsage });
+      showStatus('✅ Group removed successfully!');
     }
     
-    showStatus('✅ Website removed successfully!');
     modal.style.display = 'none';
     confirmPasswordInput.value = '';
     window.pendingRemoval = null;
@@ -436,6 +577,43 @@ window.addEventListener('DOMContentLoaded', function() {
         showStatus('Error: ' + error.message, true);
       }
     });
+  }
+
+  // Add URL to pending group list
+  const addGroupUrlBtn = document.getElementById('addGroupUrlBtn');
+  if (addGroupUrlBtn) {
+    addGroupUrlBtn.addEventListener('click', () => {
+      const input = document.getElementById('groupUrl');
+      const url = normalizeUrl(input.value);
+      if (!url) {
+        showStatus('Please enter a URL to add to the group', true);
+        return;
+      }
+      if (pendingGroupUrls.includes(url)) {
+        showStatus('URL already added to this group', true);
+        return;
+      }
+      pendingGroupUrls.push(url);
+      input.value = '';
+      renderPendingGroupUrls();
+    });
+  }
+
+  // Allow Enter in group URL input to add URL
+  const groupUrlInput = document.getElementById('groupUrl');
+  if (groupUrlInput) {
+    groupUrlInput.addEventListener('keypress', (e) => {
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        document.getElementById('addGroupUrlBtn').click();
+      }
+    });
+  }
+
+  // Create group button
+  const createGroupBtn = document.getElementById('createGroupBtn');
+  if (createGroupBtn) {
+    createGroupBtn.addEventListener('click', createGroup);
   }
 
   // Handle block type radio change
